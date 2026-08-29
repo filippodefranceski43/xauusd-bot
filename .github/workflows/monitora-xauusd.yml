@@ -15,9 +15,6 @@ on:
     - cron: "*/1 7-21 * * *"
   workflow_dispatch: {}  # permette anche di farlo partire manualmente da GitHub per testare
 
-permissions:
-  contents: write  # necessario per salvare state.json (l'ultimo segnale) nel repository
-
 jobs:
   controlla-mercato:
     runs-on: ubuntu-latest
@@ -38,14 +35,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ secrets.CLOUDFLARE_KV_NAMESPACE_ID }}
         run: python bot.py
-
-      - name: Salva l'eventuale nuovo segnale nel repository
-        run: |
-          if [ -f state.json ]; then
-            git config user.name "xauusd-bot"
-            git config user.email "actions@github.com"
-            git add state.json
-            git diff --cached --quiet || git commit -m "Aggiorna stato bot [skip ci]"
-            git push
-          fi
