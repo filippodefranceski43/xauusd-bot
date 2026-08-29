@@ -1,0 +1,28 @@
+name: Monitoraggio XAUUSD
+
+on:
+  schedule:
+    - cron: "*/15 7-21 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  controlla-mercato:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scarica il codice del repository
+        uses: actions/checkout@v4
+
+      - name: Imposta Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installa le dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Esegui il controllo del mercato
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+        run: python bot.py
