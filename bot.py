@@ -19,7 +19,9 @@ COSA FA:
   NON genera segnali di trading (per evitare segnali basati su dati vecchi).
 - Se le condizioni tecniche indicano un possibile "buon momento" (mercato
   aperto), manda un messaggio Telegram con direzione, entrata, Stop Loss,
-  3 Take Profit.
+  3 Take Profit, e ti invita a rispondere con il tuo budget e quanto sei
+  disposto a rischiare: fatto questo, ti calcola il volume (lotti) esatto
+  da inserire su MT5 per rispettare quel rischio.
 - NON si collega a MetaTrader 5 e NON esegue nessuna operazione da solo.
   L'esecuzione resta sempre manuale, a te.
 
@@ -39,7 +41,10 @@ d'ambiente quando gira su GitHub Actions.
 """
 
 import os
+import re
 import sys
+import json
+import math
 import logging
 from datetime import datetime, timedelta
 
@@ -104,6 +109,35 @@ def is_market_closed(now_utc: datetime = None, last_candle_time=None) -> bool:
         stale_data = (now_utc - last_candle_time_utc) > timedelta(minutes=90)
 
     return weekend_closed or stale_data
+
+
+# ---------------------------------------------------------------------------
+# STATO PERSISTENTE (ultimo segnale) - salvato in un file dentro il
+# repository, cosi' "sopravvive" tra un'esecuzione e l'altra dello script
+# (ogni esecuzione parte da zero, non ha memoria propria).
+# ---------------------------------------------------------------------------
+STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+
+def load_state() -> dict:
+    if not os.path.exists(STATE_PATH):
+        return {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def save_last_signal(signal: dict, now: datetime) -> None:
+    state = load_state()
+    state["ultimo_segnale"] = {**signal, "creato_alle": now.isoformat()}
+    save_state(state)
 
 
 # ---------------------------------------------------------------------------
@@ -325,15 +359,18 @@ def build_market_report(df, market_closed: bool) -> str:
 
 
 def process_incoming_messages(df, market_closed: bool) -> None:
-    """Legge eventuali messaggi che hai scritto al bot. Se il testo e' (o
-    contiene) la parola 'mercato', risponde con il report. Ignora messaggi
-    da chat diverse dalla tua, e qualsiasi altro testo."""
+    """Legge eventuali messaggi che hai scritto al bot:
+    - "mercato" -> risponde con la fotografia del mercato
+    - "budget rischio%" (es. "300 5") -> calcola il volume MT5 in base
+      all'ultimo segnale salvato, se ancora valido
+    Ignora messaggi da chat diverse dalla tua, e qualsiasi altro testo."""
     updates = get_telegram_updates()
     if not updates:
         return
 
     my_chat_id = str(config.TELEGRAM_CHAT_ID)
     richieste_mercato = 0
+    richieste_budget = []
 
     for u in updates:
         msg = u.get("message")
@@ -341,13 +378,49 @@ def process_incoming_messages(df, market_closed: bool) -> None:
             continue
         if str(msg.get("chat", {}).get("id")) != my_chat_id:
             continue
-        testo = (msg.get("text") or "").strip().lower()
-        if testo == "mercato":
+        testo = (msg.get("text") or "").strip()
+        testo_lower = testo.lower()
+
+        if testo_lower == "mercato":
             richieste_mercato += 1
+            continue
+
+        budget_rischio = parse_budget_rischio(testo)
+        if budget_rischio:
+            richieste_budget.append(budget_rischio)
 
     if richieste_mercato:
         log.info("Ricevuta/e %d richiesta/e 'mercato', rispondo.", richieste_mercato)
         send_telegram_message(build_market_report(df, market_closed))
+
+    if richieste_budget:
+        log.info("Ricevuta/e %d richiesta/e budget/rischio.", len(richieste_budget))
+        stato = load_state()
+        ultimo_segnale = stato.get("ultimo_segnale")
+
+        for budget, rischio_pct in richieste_budget:
+            if not ultimo_segnale:
+                send_telegram_message(
+                    "Non ho nessun segnale recente a cui riferire questo calcolo. "
+                    "Aspetta la prossima notifica di ingresso, poi rispondimi con "
+                    "budget e rischio%."
+                )
+                continue
+
+            creato_alle = datetime.fromisoformat(ultimo_segnale["creato_alle"])
+            eta_minuti = (datetime.now(TZ) - creato_alle).total_seconds() / 60
+            if eta_minuti > config.SIGNAL_VALIDITY_MINUTES:
+                send_telegram_message(
+                    f"L'ultimo segnale risale a più di {config.SIGNAL_VALIDITY_MINUTES} "
+                    f"minuti fa ed è considerato scaduto (il mercato potrebbe essersi "
+                    f"mosso troppo). Aspetta una nuova notifica di ingresso."
+                )
+                continue
+
+            calcolo = calcola_statistiche_mt5(ultimo_segnale, budget, rischio_pct)
+            send_telegram_message(
+                format_statistiche_mt5(ultimo_segnale, budget, rischio_pct, calcolo)
+            )
 
     # Segna come letti TUTTI gli update ricevuti (anche quelli scartati),
     # cosi' non restano "in coda" per sempre.
@@ -365,8 +438,89 @@ def format_signal_message(signal: dict) -> str:
         f"TP3: {signal['tp3']}\n\n"
         f"RSI: {signal['rsi']}\n"
         f"Motivo: {signal['motivo']}\n\n"
+        f"💰 Rispondimi con <b>budget e rischio%</b> (es. <code>300 5</code> "
+        f"= budget 300€, rischio 5%) e ti calcolo il volume esatto da "
+        f"inserire su MT5.\n\n"
         f"⚠️ Verifica sempre tu prima di operare. Questo NON è un consiglio "
         f"finanziario, è un filtro automatico basato su regole tecniche."
+    )
+
+
+# ---------------------------------------------------------------------------
+# CALCOLO LOTTO (money management) IN BASE A BUDGET E RISCHIO
+# ---------------------------------------------------------------------------
+RICHIESTA_BUDGET_RISCHIO = re.compile(
+    r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*[,\s]+([0-9]+(?:[.,][0-9]+)?)\s*%?\s*$"
+)
+
+
+def parse_budget_rischio(testo: str):
+    """Riconosce messaggi tipo '300 5' o '300,5' -> (budget=300.0, rischio_pct=5.0).
+    Ritorna None se il testo non corrisponde a questo formato."""
+    m = RICHIESTA_BUDGET_RISCHIO.match(testo)
+    if not m:
+        return None
+    budget = float(m.group(1).replace(",", "."))
+    rischio_pct = float(m.group(2).replace(",", "."))
+    if budget <= 0 or rischio_pct <= 0:
+        return None
+    return budget, rischio_pct
+
+
+def calcola_statistiche_mt5(signal: dict, budget: float, rischio_pct: float) -> dict:
+    """Calcola il volume (lotti) da inserire su MT5 in base al budget e alla
+    percentuale di rischio, usando la distanza tra entrata e Stop Loss del
+    segnale. XAUUSD: 1 lotto standard = 100 once -> 1$ di movimento = 100$
+    di profitto/perdita per 1.00 lotto (quindi 1$ = 1€ circa per 0.01 lotto)."""
+    rischio_euro = budget * (rischio_pct / 100)
+    distanza_sl = abs(signal["entry"] - signal["sl"])
+    perdita_per_lotto_intero = distanza_sl * 100  # $ persi con SL colpito, a 1.00 lotto
+
+    if perdita_per_lotto_intero <= 0:
+        return None
+
+    lotto_esatto = rischio_euro / perdita_per_lotto_intero
+    lotto_arrotondato = math.floor(lotto_esatto * 100) / 100  # arrotonda per difetto a 0.01
+
+    return {
+        "rischio_euro": round(rischio_euro, 2),
+        "distanza_sl": round(distanza_sl, 2),
+        "lotto_esatto": round(lotto_esatto, 4),
+        "lotto_consigliato": round(lotto_arrotondato, 2),
+    }
+
+
+def format_statistiche_mt5(signal: dict, budget: float, rischio_pct: float, calcolo: dict) -> str:
+    emoji = "🟢" if signal["direction"] == "BUY" else "🔴"
+
+    if calcolo is None or calcolo["lotto_consigliato"] <= 0:
+        return (
+            f"⚠️ Con budget {budget:.0f}€ e rischio {rischio_pct:.1f}%, il rischio "
+            f"in euro ({budget * rischio_pct / 100:.2f}€) è troppo basso rispetto "
+            f"alla distanza dello Stop Loss: risulterebbe un volume inferiore al "
+            f"lotto minimo negoziabile (0.01).\n\n"
+            f"Per operare su questo segnale dovresti aumentare la percentuale di "
+            f"rischio, oppure accettare che il rischio minimo possibile sia "
+            f"leggermente più alto di quanto indicato."
+        )
+
+    return (
+        f"🧮 <b>Statistiche per MT5 — XAUUSD {signal['direction']}</b> {emoji}\n\n"
+        f"Budget dichiarato: {budget:.0f}€\n"
+        f"Rischio scelto: {rischio_pct:.1f}% → <b>{calcolo['rischio_euro']:.2f}€</b>\n"
+        f"Distanza entrata-SL: {calcolo['distanza_sl']}\n\n"
+        f"Da inserire su MT5 (schermata Market Execution):\n"
+        f"• Direzione: <b>{'Buy' if signal['direction'] == 'BUY' else 'Sell'} by Market</b>\n"
+        f"• Volume: <b>{calcolo['lotto_consigliato']}</b> lotti\n"
+        f"• Stop Loss: <b>{signal['sl']}</b>\n"
+        f"• Take Profit: <b>{signal['tp1']}</b> (o TP2 {signal['tp2']} / TP3 {signal['tp3']} "
+        f"se gestisci l'uscita a più livelli)\n\n"
+        f"Con questo volume, se lo Stop Loss viene colpito perdi circa "
+        f"<b>{calcolo['lotto_consigliato'] * calcolo['distanza_sl'] * 100:.2f}€</b> "
+        f"(coerente con il rischio scelto).\n\n"
+        f"⚠️ Controlla comunque su MT5 il \"margine richiesto\" prima di confermare: "
+        f"dipende dalla leva del tuo broker, che questo calcolo non conosce. Non è "
+        f"un consiglio finanziario."
     )
 
 
@@ -406,6 +560,7 @@ def main():
 
     if signal:
         log.info("Segnale trovato: %s", signal)
+        save_last_signal(signal, now)
         send_telegram_message(format_signal_message(signal))
     else:
         log.info("Nessuna condizione di ingresso al momento.")
