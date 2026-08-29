@@ -21,6 +21,13 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "INSERISCI_QUI_IL_TUO_CHAT
 TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "INSERISCI_QUI_LA_TUA_API_KEY")
 
 # ---------------------------------------------------------------------------
+# CLOUDFLARE (per salvare l'ultimo segnale, letto poi dal Worker/webhook)
+# ---------------------------------------------------------------------------
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "INSERISCI_QUI_IL_TUO_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "INSERISCI_QUI_IL_TUO_ACCOUNT_ID")
+CLOUDFLARE_KV_NAMESPACE_ID = os.environ.get("CLOUDFLARE_KV_NAMESPACE_ID", "INSERISCI_QUI_IL_NAMESPACE_ID")
+
+# ---------------------------------------------------------------------------
 # FASCIA ORARIA ATTIVA (ora italiana, formato 24h)
 # ---------------------------------------------------------------------------
 ORARIO_INIZIO = 9   # il bot inizia a controllare il mercato dalle 9:00
@@ -33,7 +40,9 @@ TIMEFRAME = "15min"              # candele a 15 minuti (opzioni Twelve Data: 1mi
 CANDELE_STORICO = 200            # quante candele scaricare ad ogni controllo
 INTERVALLO_CONTROLLO_SECONDI = 300  # ogni quanto ricontrollare il mercato (300 = 5 minuti)
 COOLDOWN_MINUTI = 120            # non rimandare lo stesso tipo di segnale prima di X minuti
-SIGNAL_VALIDITY_MINUTES = 180     # dopo quanto un segnale e' considerato "scaduto" per il calcolo del lotto
+# NOTA: SIGNAL_VALIDITY_MINUTES (scadenza del segnale per il calcolo del
+# lotto) ora vive dentro webhook.js, non qui: se lo modifichi, aggiornalo
+# in entrambi i file per restare coerenti.
 
 # ---------------------------------------------------------------------------
 # PARAMETRI INDICATORI (puoi modificarli per rendere il bot piu'/meno permissivo)
