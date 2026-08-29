@@ -2,7 +2,7 @@ name: Monitoraggio XAUUSD
 
 on:
   schedule:
-    - cron: "*/15 7-21 * * *"
+    - cron: "*/5 7-21 * * *"
   workflow_dispatch: {}
 
 jobs:
