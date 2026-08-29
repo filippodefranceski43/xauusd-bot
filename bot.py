@@ -4,17 +4,22 @@ Bot di monitoraggio XAUUSD -> notifica Telegram (versione GitHub Actions)
 
 COSA FA:
 - Fa UN SOLO controllo del mercato XAU/USD e poi termina (non resta acceso).
-- E' pensato per essere lanciato automaticamente ogni 15 minuti da GitHub
-  Actions (gratis), che si occupa lui di "risvegliarlo" a intervalli.
+- E' pensato per essere lanciato automaticamente a intervalli ravvicinati da
+  GitHub Actions (gratis), che si occupa lui di "risvegliarlo".
 - Se e' fuori dalla fascia oraria attiva (9:00-23:00, Europe/Rome), il
   controllo si ferma subito senza fare nulla.
-- Se le condizioni tecniche indicano un possibile "buon momento", manda un
-  messaggio Telegram con direzione, entrata, Stop Loss, 3 Take Profit.
-- Se nel frattempo TU hai scritto un messaggio al bot, ad ogni controllo lo
-  legge e ti risponde con una "fotografia" del mercato in quel momento
-  (prezzo attuale, RSI, trend, supporto/resistenza). NON e' una chat in
-  tempo reale: la risposta arriva al controllo successivo (quindi entro
-  l'intervallo impostato nel workflow, es. 5 minuti), non istantaneamente.
+- Se scrivi al bot su Telegram esattamente la parola "mercato", ad ogni
+  controllo lo legge e ti risponde con una "fotografia" del mercato in
+  quel momento (prezzo, RSI, trend, variazione 24h, massimo/minimo 24h,
+  supporto/resistenza, volatilita'). NON e' una chat in tempo reale: la
+  risposta arriva al controllo successivo (entro l'intervallo impostato
+  nel workflow), non istantaneamente.
+- Se il mercato e' chiuso (weekend, o dati fermi/non aggiornati), lo dice
+  chiaramente sia nella risposta a "mercato" sia nei log, e in quel caso
+  NON genera segnali di trading (per evitare segnali basati su dati vecchi).
+- Se le condizioni tecniche indicano un possibile "buon momento" (mercato
+  aperto), manda un messaggio Telegram con direzione, entrata, Stop Loss,
+  3 Take Profit.
 - NON si collega a MetaTrader 5 e NON esegue nessuna operazione da solo.
   L'esecuzione resta sempre manuale, a te.
 
@@ -36,7 +41,7 @@ d'ambiente quando gira su GitHub Actions.
 import os
 import sys
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
@@ -67,6 +72,38 @@ def is_within_active_hours(now: datetime = None) -> bool:
     start = now.replace(hour=config.ORARIO_INIZIO, minute=0, second=0, microsecond=0)
     end = now.replace(hour=config.ORARIO_FINE, minute=0, second=0, microsecond=0)
     return start <= now < end
+
+
+# ---------------------------------------------------------------------------
+# MERCATO APERTO/CHIUSO
+# ---------------------------------------------------------------------------
+def is_market_closed(now_utc: datetime = None, last_candle_time=None) -> bool:
+    """
+    Stima se il mercato XAUUSD e' chiuso (weekend). Il forex/oro chiude
+    circa venerdi' alle 22:00 UTC e riapre domenica alle 22:00 UTC (orari
+    approssimativi, variano leggermente da broker a broker).
+
+    In aggiunta, se l'ultima candela ricevuta dai dati e' piu' vecchia di
+    90 minuti rispetto ad ora, trattiamo il mercato come chiuso/dati fermi
+    anche in un giorno feriale (es. festivita').
+    """
+    now_utc = now_utc or datetime.now(ZoneInfo("UTC"))
+    weekday = now_utc.weekday()  # Monday=0 ... Sunday=6
+
+    weekend_closed = (
+        weekday == 5  # sabato: chiuso tutto il giorno
+        or (weekday == 6 and now_utc.hour < 22)  # domenica prima delle 22 UTC
+        or (weekday == 4 and now_utc.hour >= 22)  # venerdi' dopo le 22 UTC
+    )
+
+    stale_data = False
+    if last_candle_time is not None:
+        last_candle_time_utc = last_candle_time
+        if last_candle_time_utc.tzinfo is None:
+            last_candle_time_utc = last_candle_time_utc.replace(tzinfo=ZoneInfo("UTC"))
+        stale_data = (now_utc - last_candle_time_utc) > timedelta(minutes=90)
+
+    return weekend_closed or stale_data
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +146,15 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range: misura la volatilita' recente del prezzo."""
+    high_low = df["high"] - df["low"]
+    high_prev_close = (df["high"] - df["close"].shift()).abs()
+    low_prev_close = (df["low"] - df["close"].shift()).abs()
+    true_range = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    return true_range.rolling(period).mean()
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["sma_fast"] = df["close"].rolling(config.SMA_FAST).mean()
@@ -116,6 +162,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["rsi"] = compute_rsi(df["close"], config.RSI_PERIOD)
     df["recent_low"] = df["low"].rolling(config.SR_LOOKBACK).min()
     df["recent_high"] = df["high"].rolling(config.SR_LOOKBACK).max()
+    df["atr"] = compute_atr(df, period=14)
     return df
 
 
@@ -202,8 +249,21 @@ def mark_updates_as_read(updates: list) -> None:
     requests.get(url, params={"offset": last_update_id + 1, "timeout": 0}, timeout=15)
 
 
-def build_market_report(df) -> str:
+def build_market_report(df, market_closed: bool) -> str:
     """Costruisce un messaggio con una 'fotografia' del mercato attuale."""
+    now_str = datetime.now(TZ).strftime("%d/%m %H:%M")
+
+    if market_closed:
+        return (
+            f"📴 <b>XAUUSD — mercato CHIUSO</b>\n"
+            f"<i>{now_str}</i>\n\n"
+            f"Il mercato dell'oro è chiuso in questo momento (weekend o dati "
+            f"non aggiornati). Riapre indicativamente domenica sera / lunedì "
+            f"mattina.\n\n"
+            f"Non ti mando dati di prezzo perché con il mercato chiuso "
+            f"sarebbero non aggiornati e potrebbero fuorviarti."
+        )
+
     last = df.iloc[-1]
     price = last["close"]
     rsi = last["rsi"]
@@ -211,6 +271,7 @@ def build_market_report(df) -> str:
     sma_slow = last["sma_slow"]
     support = last["recent_low"]
     resistance = last["recent_high"]
+    atr = last["atr"]
 
     if pd.isna(rsi):
         rsi_status = "dati insufficienti"
@@ -230,7 +291,23 @@ def build_market_report(df) -> str:
     else:
         trend = "laterale"
 
-    now_str = datetime.now(TZ).strftime("%d/%m %H:%M")
+    # Variazione e massimo/minimo delle ultime 24 ore (in base al timeframe
+    # configurato: con candele da 15 min, 24h = 96 candele)
+    candele_24h = int(24 * 60 / int("".join(filter(str.isdigit, config.TIMEFRAME)) or 15))
+    if len(df) > candele_24h:
+        finestra_24h = df.iloc[-candele_24h:]
+        prezzo_24h_fa = df.iloc[-candele_24h]["close"]
+        variazione_pct = ((price - prezzo_24h_fa) / prezzo_24h_fa) * 100
+        massimo_24h = finestra_24h["high"].max()
+        minimo_24h = finestra_24h["low"].min()
+        riga_24h = (
+            f"Variazione 24h: {variazione_pct:+.2f}%\n"
+            f"Massimo/minimo 24h: {massimo_24h:.2f} / {minimo_24h:.2f}\n"
+        )
+    else:
+        riga_24h = ""
+
+    volatilita = f"{atr:.2f}" if not pd.isna(atr) else "dati insufficienti"
 
     return (
         f"📊 <b>XAUUSD — fotografia del mercato</b>\n"
@@ -238,30 +315,39 @@ def build_market_report(df) -> str:
         f"Prezzo attuale: <b>{price:.2f}</b>\n"
         f"RSI: {rsi_status}\n"
         f"Trend di fondo: {trend}\n"
+        f"{riga_24h}"
         f"Supporto recente: {support:.2f}\n"
-        f"Resistenza recente: {resistance:.2f}\n\n"
+        f"Resistenza recente: {resistance:.2f}\n"
+        f"Volatilità (ATR 14): {volatilita} $ a candela\n\n"
         f"⚠️ Non è un consiglio finanziario, è solo una lettura automatica "
         f"degli indicatori al momento della richiesta."
     )
 
 
-def process_incoming_messages(df) -> None:
-    """Legge eventuali messaggi che hai scritto al bot e risponde con un
-    report del mercato. Ignora messaggi da chat diverse dalla tua."""
+def process_incoming_messages(df, market_closed: bool) -> None:
+    """Legge eventuali messaggi che hai scritto al bot. Se il testo e' (o
+    contiene) la parola 'mercato', risponde con il report. Ignora messaggi
+    da chat diverse dalla tua, e qualsiasi altro testo."""
     updates = get_telegram_updates()
     if not updates:
         return
 
     my_chat_id = str(config.TELEGRAM_CHAT_ID)
-    relevant = [
-        u for u in updates
-        if "message" in u and str(u["message"].get("chat", {}).get("id")) == my_chat_id
-    ]
+    richieste_mercato = 0
 
-    if relevant:
-        log.info("Trovati %d messaggi nuovi, rispondo con il report del mercato.", len(relevant))
-        report = build_market_report(df)
-        send_telegram_message(report)
+    for u in updates:
+        msg = u.get("message")
+        if not msg:
+            continue
+        if str(msg.get("chat", {}).get("id")) != my_chat_id:
+            continue
+        testo = (msg.get("text") or "").strip().lower()
+        if testo == "mercato":
+            richieste_mercato += 1
+
+    if richieste_mercato:
+        log.info("Ricevuta/e %d richiesta/e 'mercato', rispondo.", richieste_mercato)
+        send_telegram_message(build_market_report(df, market_closed))
 
     # Segna come letti TUTTI gli update ricevuti (anche quelli scartati),
     # cosi' non restano "in coda" per sempre.
@@ -299,10 +385,23 @@ def main():
     df = fetch_price_data(interval=config.TIMEFRAME, outputsize=config.CANDELE_STORICO)
     df = add_indicators(df)
 
-    # 1) Rispondi a eventuali messaggi che hai scritto al bot nel frattempo
-    process_incoming_messages(df)
+    ultima_candela = df.iloc[-1]["datetime"]
+    chiuso = is_market_closed(
+        now_utc=datetime.now(ZoneInfo("UTC")),
+        last_candle_time=ultima_candela,
+    )
+    if chiuso:
+        log.info("Mercato considerato chiuso (weekend o dati non aggiornati).")
+
+    # 1) Rispondi a eventuali messaggi "mercato" che hai scritto al bot
+    process_incoming_messages(df, chiuso)
 
     # 2) Controlla se ci sono le condizioni per un segnale di trading
+    #    (solo se il mercato e' aperto: con dati fermi non avrebbe senso)
+    if chiuso:
+        log.info("Mercato chiuso: nessun controllo segnali.")
+        return
+
     signal = generate_signal(df)
 
     if signal:
