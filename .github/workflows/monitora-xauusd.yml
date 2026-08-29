@@ -1,9 +1,19 @@
 name: Monitoraggio XAUUSD
 
+# Fa partire bot.py ogni minuto, tra le 7:00 e le 21:59 UTC.
+# Questa finestra UTC copre sempre le 9:00-23:00 ora italiana, sia in ora
+# solare (UTC+1) che in ora legale (UTC+2). Il controllo preciso sull'orario
+# esatto (9:00-23:00 Italia) lo fa comunque bot.py appena parte: se e' fuori
+# fascia si ferma subito senza consumare altro.
+#
+# NOTA IMPORTANTE: GitHub non garantisce che i cron job partano esattamente
+# al minuto preciso, soprattutto con intervalli cosi' brevi - nei momenti di
+# traffico alto sulla piattaforma possono esserci ritardi di qualche minuto.
+# E' il limite del piano gratuito, non un errore di configurazione.
 on:
   schedule:
     - cron: "*/1 7-21 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}  # permette anche di farlo partire manualmente da GitHub per testare
 
 jobs:
   controlla-mercato:
