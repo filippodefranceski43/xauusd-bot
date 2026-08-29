@@ -10,6 +10,11 @@ COSA FA:
   controllo si ferma subito senza fare nulla.
 - Se le condizioni tecniche indicano un possibile "buon momento", manda un
   messaggio Telegram con direzione, entrata, Stop Loss, 3 Take Profit.
+- Se nel frattempo TU hai scritto un messaggio al bot, ad ogni controllo lo
+  legge e ti risponde con una "fotografia" del mercato in quel momento
+  (prezzo attuale, RSI, trend, supporto/resistenza). NON e' una chat in
+  tempo reale: la risposta arriva al controllo successivo (quindi entro
+  l'intervallo impostato nel workflow, es. 5 minuti), non istantaneamente.
 - NON si collega a MetaTrader 5 e NON esegue nessuna operazione da solo.
   L'esecuzione resta sempre manuale, a te.
 
@@ -178,6 +183,91 @@ def send_telegram_message(text: str) -> None:
         sys.exit(1)
 
 
+def get_telegram_updates():
+    """Recupera i messaggi nuovi ricevuti dal bot (non ancora letti)."""
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates"
+    resp = requests.get(url, params={"timeout": 0}, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("result", [])
+
+
+def mark_updates_as_read(updates: list) -> None:
+    """Segna come 'letti' i messaggi appena processati, cosi' al prossimo
+    controllo Telegram non li rimanda piu'."""
+    if not updates:
+        return
+    last_update_id = max(u["update_id"] for u in updates)
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/getUpdates"
+    requests.get(url, params={"offset": last_update_id + 1, "timeout": 0}, timeout=15)
+
+
+def build_market_report(df) -> str:
+    """Costruisce un messaggio con una 'fotografia' del mercato attuale."""
+    last = df.iloc[-1]
+    price = last["close"]
+    rsi = last["rsi"]
+    sma_fast = last["sma_fast"]
+    sma_slow = last["sma_slow"]
+    support = last["recent_low"]
+    resistance = last["recent_high"]
+
+    if pd.isna(rsi):
+        rsi_status = "dati insufficienti"
+    elif rsi >= config.RSI_OVERBOUGHT:
+        rsi_status = f"ipercomprato ({rsi:.1f}) — occhio a possibili storni"
+    elif rsi <= config.RSI_OVERSOLD:
+        rsi_status = f"ipervenduto ({rsi:.1f}) — occhio a possibili rimbalzi"
+    else:
+        rsi_status = f"neutrale ({rsi:.1f})"
+
+    if pd.isna(sma_fast) or pd.isna(sma_slow):
+        trend = "dati insufficienti"
+    elif sma_fast > sma_slow:
+        trend = "rialzista (media veloce sopra la lenta)"
+    elif sma_fast < sma_slow:
+        trend = "ribassista (media veloce sotto la lenta)"
+    else:
+        trend = "laterale"
+
+    now_str = datetime.now(TZ).strftime("%d/%m %H:%M")
+
+    return (
+        f"📊 <b>XAUUSD — fotografia del mercato</b>\n"
+        f"<i>{now_str}</i>\n\n"
+        f"Prezzo attuale: <b>{price:.2f}</b>\n"
+        f"RSI: {rsi_status}\n"
+        f"Trend di fondo: {trend}\n"
+        f"Supporto recente: {support:.2f}\n"
+        f"Resistenza recente: {resistance:.2f}\n\n"
+        f"⚠️ Non è un consiglio finanziario, è solo una lettura automatica "
+        f"degli indicatori al momento della richiesta."
+    )
+
+
+def process_incoming_messages(df) -> None:
+    """Legge eventuali messaggi che hai scritto al bot e risponde con un
+    report del mercato. Ignora messaggi da chat diverse dalla tua."""
+    updates = get_telegram_updates()
+    if not updates:
+        return
+
+    my_chat_id = str(config.TELEGRAM_CHAT_ID)
+    relevant = [
+        u for u in updates
+        if "message" in u and str(u["message"].get("chat", {}).get("id")) == my_chat_id
+    ]
+
+    if relevant:
+        log.info("Trovati %d messaggi nuovi, rispondo con il report del mercato.", len(relevant))
+        report = build_market_report(df)
+        send_telegram_message(report)
+
+    # Segna come letti TUTTI gli update ricevuti (anche quelli scartati),
+    # cosi' non restano "in coda" per sempre.
+    mark_updates_as_read(updates)
+
+
 def format_signal_message(signal: dict) -> str:
     emoji = "🟢" if signal["direction"] == "BUY" else "🔴"
     return (
@@ -208,6 +298,11 @@ def main():
 
     df = fetch_price_data(interval=config.TIMEFRAME, outputsize=config.CANDELE_STORICO)
     df = add_indicators(df)
+
+    # 1) Rispondi a eventuali messaggi che hai scritto al bot nel frattempo
+    process_incoming_messages(df)
+
+    # 2) Controlla se ci sono le condizioni per un segnale di trading
     signal = generate_signal(df)
 
     if signal:
