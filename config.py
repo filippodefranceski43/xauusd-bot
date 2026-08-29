@@ -33,6 +33,7 @@ TIMEFRAME = "15min"              # candele a 15 minuti (opzioni Twelve Data: 1mi
 CANDELE_STORICO = 200            # quante candele scaricare ad ogni controllo
 INTERVALLO_CONTROLLO_SECONDI = 300  # ogni quanto ricontrollare il mercato (300 = 5 minuti)
 COOLDOWN_MINUTI = 120            # non rimandare lo stesso tipo di segnale prima di X minuti
+SIGNAL_VALIDITY_MINUTES = 180     # dopo quanto un segnale e' considerato "scaduto" per il calcolo del lotto
 
 # ---------------------------------------------------------------------------
 # PARAMETRI INDICATORI (puoi modificarli per rendere il bot piu'/meno permissivo)
