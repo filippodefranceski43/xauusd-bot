@@ -10,6 +10,11 @@ COSA FA QUESTO FILE (bot.py):
   controllo si ferma subito senza fare nulla.
 - Se il mercato e' chiuso (weekend, o dati fermi/non aggiornati), non
   genera segnali (per evitare segnali basati su dati vecchi).
+- Ti avvisa su Telegram quando il mercato PASSA da aperto a chiuso o
+  viceversa (non ad ogni controllo, solo al cambiamento). Il controllo
+  resta legato alla fascia attiva 9:00-23:00, quindi un cambiamento
+  avvenuto fuori da quella fascia viene notificato al primo controllo
+  utile dentro l'orario attivo, non nell'istante esatto.
 - Se le condizioni tecniche indicano un possibile "buon momento" (mercato
   aperto), manda un messaggio Telegram con direzione, entrata, Stop Loss,
   3 Take Profit, e salva il segnale su Cloudflare KV (un mini-database
@@ -256,6 +261,65 @@ def save_signal_to_cloudflare_kv(signal: dict, now: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CLOUDFLARE KV - stato mercato (aperto/chiuso), per notificarti solo
+# quando CAMBIA, non ad ogni controllo
+# ---------------------------------------------------------------------------
+def get_market_state_kv():
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{config.CLOUDFLARE_ACCOUNT_ID}"
+        f"/storage/kv/namespaces/{config.CLOUDFLARE_KV_NAMESPACE_ID}/values/stato_mercato"
+    )
+    headers = {"Authorization": f"Bearer {config.CLOUDFLARE_API_TOKEN}"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code == 404:
+        return None  # prima esecuzione in assoluto, nessuno stato salvato ancora
+    if not resp.ok:
+        log.error("Errore lettura stato mercato da Cloudflare KV: %s", resp.text)
+        return None
+    return resp.text.strip()
+
+
+def save_market_state_kv(stato: str) -> None:
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{config.CLOUDFLARE_ACCOUNT_ID}"
+        f"/storage/kv/namespaces/{config.CLOUDFLARE_KV_NAMESPACE_ID}/values/stato_mercato"
+    )
+    headers = {
+        "Authorization": f"Bearer {config.CLOUDFLARE_API_TOKEN}",
+        "Content-Type": "text/plain",
+    }
+    resp = requests.put(url, headers=headers, data=stato, timeout=15)
+    if not resp.ok:
+        log.error("Errore salvataggio stato mercato su Cloudflare KV: %s", resp.text)
+
+
+def notifica_se_cambiato_stato_mercato(chiuso: bool) -> None:
+    """Manda una notifica Telegram SOLO quando il mercato passa da aperto a
+    chiuso o viceversa (non ad ogni controllo)."""
+    stato_attuale = "chiuso" if chiuso else "aperto"
+    stato_precedente = get_market_state_kv()
+
+    if stato_precedente is not None and stato_precedente != stato_attuale:
+        log.info("Transizione mercato rilevata: %s -> %s", stato_precedente, stato_attuale)
+        if stato_attuale == "chiuso":
+            messaggio = (
+                "📴 <b>Mercato XAUUSD CHIUSO</b>\n\n"
+                "Il mercato dell'oro si è appena chiuso (weekend). Riapre "
+                "indicativamente domenica sera / lunedì mattina. In questo "
+                "periodo non riceverai notifiche di segnale."
+            )
+        else:
+            messaggio = (
+                "🟢 <b>Mercato XAUUSD APERTO</b>\n\n"
+                "Il mercato dell'oro è appena riaperto. Il monitoraggio dei "
+                "segnali riprende normalmente."
+            )
+        send_telegram_message(messaggio)
+
+    save_market_state_kv(stato_attuale)
+
+
+# ---------------------------------------------------------------------------
 # ESECUZIONE SINGOLA (chiamata da GitHub Actions)
 # ---------------------------------------------------------------------------
 def main():
@@ -275,6 +339,9 @@ def main():
         now_utc=datetime.now(ZoneInfo("UTC")),
         last_candle_time=ultima_candela,
     )
+
+    notifica_se_cambiato_stato_mercato(chiuso)
+
     if chiuso:
         log.info("Mercato chiuso (weekend o dati non aggiornati): nessun controllo segnali.")
         return
