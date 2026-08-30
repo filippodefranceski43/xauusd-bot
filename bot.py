@@ -11,10 +11,10 @@ COSA FA QUESTO FILE (bot.py):
 - Se il mercato e' chiuso (weekend, o dati fermi/non aggiornati), non
   genera segnali (per evitare segnali basati su dati vecchi).
 - Ti avvisa su Telegram quando il mercato PASSA da aperto a chiuso o
-  viceversa (non ad ogni controllo, solo al cambiamento). Il controllo
-  resta legato alla fascia attiva 9:00-23:00, quindi un cambiamento
-  avvenuto fuori da quella fascia viene notificato al primo controllo
-  utile dentro l'orario attivo, non nell'istante esatto.
+  viceversa (non ad ogni controllo, solo al cambiamento). Questo controllo
+  gira 24 ore su 24 (anche di notte, con frequenza ridotta per non
+  sforare i limiti gratuiti di Twelve Data), a differenza delle notifiche
+  di segnale (BUY/SELL) che restano SOLO nella fascia 9:00-23:00.
 - Se le condizioni tecniche indicano un possibile "buon momento" (mercato
   aperto), manda un messaggio Telegram con direzione, entrata, Stop Loss,
   3 Take Profit, e salva il segnale su Cloudflare KV (un mini-database
@@ -324,11 +324,6 @@ def notifica_se_cambiato_stato_mercato(chiuso: bool) -> None:
 # ---------------------------------------------------------------------------
 def main():
     now = datetime.now(TZ)
-
-    if not is_within_active_hours(now):
-        log.info("Fuori orario attivo (%s). Nessun controllo effettuato.", now.strftime("%H:%M"))
-        return
-
     log.info("Controllo il mercato XAUUSD alle %s...", now.strftime("%H:%M"))
 
     df = fetch_price_data(interval=config.TIMEFRAME, outputsize=config.CANDELE_STORICO)
@@ -340,7 +335,14 @@ def main():
         last_candle_time=ultima_candela,
     )
 
+    # Il controllo apertura/chiusura gira SEMPRE, anche di notte e fuori
+    # fascia attiva, cosi' la notifica di "mercato aperto/chiuso" arriva
+    # appena succede, non solo quando riprende il controllo dei segnali.
     notifica_se_cambiato_stato_mercato(chiuso)
+
+    if not is_within_active_hours(now):
+        log.info("Fuori orario attivo (%s): nessun controllo segnali (solo apertura/chiusura).", now.strftime("%H:%M"))
+        return
 
     if chiuso:
         log.info("Mercato chiuso (weekend o dati non aggiornati): nessun controllo segnali.")
